@@ -22,6 +22,7 @@ struct SlideShowDocument: FileDocument {
             throw CocoaError(.fileReadCorruptFile)
         }
         show = try JSONDecoder().decode(SlideShow.self, from: json)
+        show.ensureUniqueIDs()
         for (name, wrapper) in package.fileWrappers?["Media"]?.fileWrappers ?? [:] {
             guard let data = wrapper.regularFileContents else { continue }
             media[name] = data

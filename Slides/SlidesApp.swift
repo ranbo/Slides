@@ -8,5 +8,29 @@ struct SlidesApp: App {
                 .frame(minWidth: 960, minHeight: 640)
         }
         .defaultSize(width: 1400, height: 900)
+        .commands { ShowMenuCommands() }
+    }
+}
+
+/// Playback speed and timeline zoom, for the frontmost document window.
+struct ShowMenuCommands: Commands {
+    @FocusedValue(\.showCommands) private var show
+
+    var body: some Commands {
+        CommandMenu("Playback") {
+            Button("Slower") { show?.playback.changeSpeed(by: -1) }
+                .keyboardShortcut("[", modifiers: [])
+            Button("Faster") { show?.playback.changeSpeed(by: 1) }
+                .keyboardShortcut("]", modifiers: [])
+            Button("Normal Speed") { show?.playback.speed = 1 }
+                .keyboardShortcut("\\", modifiers: [])
+        }
+        CommandGroup(after: .toolbar) {
+            Button("Zoom In Timeline") { show?.zoomTimeline(ShowTimelineView.zoomStep) }
+                .keyboardShortcut("=", modifiers: [])
+            Button("Zoom Out Timeline") { show?.zoomTimeline(1 / ShowTimelineView.zoomStep) }
+                .keyboardShortcut("-", modifiers: [])
+            Divider()
+        }
     }
 }

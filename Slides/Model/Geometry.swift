@@ -100,6 +100,24 @@ enum FrameMath {
         return NormRect(x: 0, y: (1 - h) / 2, width: 1, height: h)
     }
 
+    /// Keeps a crop from ever showing black on a side *and* on the top or bottom: it is no
+    /// bigger than `fitRect`, and along each axis it either stays inside the photo or, when
+    /// longer than the photo, covers it completely. Oversized rectangles shrink about `anchor`.
+    static func constrained(_ rect: NormRect, imageAspect: Double, outputAspect: Double,
+                            anchor: CGPoint? = nil) -> NormRect {
+        let fit = fitRect(imageAspect: imageAspect, outputAspect: outputAspect)
+        var r = rect
+        if r.width > fit.width {
+            r = r.scaled(by: fit.width / r.width, about: anchor ?? r.center)
+        }
+        func clamp(_ origin: Double, _ length: Double) -> Double {
+            length <= 1 ? min(max(origin, 0), 1 - length) : min(max(origin, 1 - length), 0)
+        }
+        r.x = clamp(r.x, r.width)
+        r.y = clamp(r.y, r.height)
+        return r
+    }
+
     /// The smallest output-shaped rectangle showing the whole photo (adds black bars).
     static func fitRect(imageAspect: Double, outputAspect: Double) -> NormRect {
         let r = normalizedRatio(imageAspect: imageAspect, outputAspect: outputAspect)

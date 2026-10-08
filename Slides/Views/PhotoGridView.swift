@@ -12,6 +12,8 @@ struct PhotoGridView: View {
     @Binding var selection: Set<UUID>
     @Binding var currentID: UUID?
     var onAddPhotos: (_ urls: [URL], _ index: Int) -> Void
+    /// Double-click: edit this photo.
+    var onOpen: (UUID) -> Void
 
     @State private var anchorID: UUID?
     @State private var draggedIDs: Set<UUID> = []
@@ -23,12 +25,14 @@ struct PhotoGridView: View {
     private var slides: [Slide] { document.show.slides }
 
     var body: some View {
+        ScrollViewReader { proxy in
         ScrollView {
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 150, maximum: 260), spacing: 12)], spacing: 12) {
                 ForEach(Array(slides.enumerated()), id: \.element.id) { index, slide in
                     GridCell(slide: slide, index: index, settings: document.show.settings,
                              isSelected: selection.contains(slide.id), marker: marker)
                         .onTapGesture { click(slide.id) }
+                        .simultaneousGesture(TapGesture(count: 2).onEnded { onOpen(slide.id) })
                         .onDrag {
                             draggedIDs = selection.contains(slide.id) ? selection : [slide.id]
                             return NSItemProvider(object: Self.internalDragToken as NSString)
@@ -38,6 +42,11 @@ struct PhotoGridView: View {
                 }
             }
             .padding(12)
+        }
+        .onChange(of: currentID) { _, id in
+            // Keep the photo being edited in view, e.g. when stepping with the arrow keys.
+            if let id { withAnimation { proxy.scrollTo(id) } }
+        }
         }
         .background(Color(nsColor: .controlBackgroundColor))
         .overlay {
@@ -62,7 +71,10 @@ struct PhotoGridView: View {
             return items
         }
         .onPasteCommand(of: [.slideClipboard, .fileURL], perform: paste)
-        .onCommand(#selector(NSResponder.selectAll(_:))) { selection = Set(slides.map(\.id)) }
+        .onCommand(#selector(NSResponder.selectAll(_:))) {
+            selection = Set(slides.map(\.id))
+            if currentID == nil { currentID = slides.first?.id }
+        }
     }
 
     // MARK: - Selection

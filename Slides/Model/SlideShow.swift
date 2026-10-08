@@ -84,6 +84,19 @@ struct SlideShow: Codable, Hashable {
     var slides: [Slide] = []
     var audio: [AudioClip] = []
 
+    /// Gives a fresh ID to any slide or clip whose ID repeats an earlier one.
+    /// Duplicates confuse the photo grid and selection.
+    mutating func ensureUniqueIDs() {
+        var seen = Set<UUID>()
+        for i in slides.indices where !seen.insert(slides[i].id).inserted {
+            slides[i].id = UUID()
+        }
+        seen.removeAll()
+        for i in audio.indices where !seen.insert(audio[i].id).inserted {
+            audio[i].id = UUID()
+        }
+    }
+
     var embeddedNames: Set<String> {
         Set(slides.compactMap(\.source.embeddedName) + audio.compactMap(\.source.embeddedName))
     }

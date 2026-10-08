@@ -7,15 +7,26 @@ struct ShowTimelineView: View {
     @Binding var selection: Set<UUID>
     @Binding var currentID: UUID?
     let playback: PlaybackController
+    /// Timeline zoom level.
+    @Binding var pointsPerSecond: Double
+    /// The zoom at which the whole show fits the visible width; the timeline keeps it current.
+    @Binding var fitPointsPerSecond: Double
     var onSeek: () -> Void
+    /// Double-click a photo: edit it.
+    var onOpen: (UUID) -> Void
     var onAddAudio: (_ urls: [URL], _ time: Double) -> Void
 
-    @State private var pointsPerSecond: Double = 40
+    static let maxPointsPerSecond = 400.0
+    /// Space after the end of the show.
+    private static let trailingSpace = 60.0
+    static let zoomStep = 1.5
     /// A slide duration being dragged, applied live and committed when the drag ends.
     @State private var durationEdit: (id: UUID, seconds: Double)?
     /// A music clip being moved or trimmed.
     @State private var clipEdit: AudioClip?
     @State private var audioTargeted = false
+    @State private var selectedClips: Set<UUID> = []
+    @FocusState private var focused: Bool
     @State private var scrollPosition = ScrollPosition(edge: .leading)
     @State private var visibleRect: CGRect = .zero
 
@@ -36,7 +47,7 @@ struct ShowTimelineView: View {
         let rows = Self.rows(for: clips)
         let audioHeight = CGFloat(max(rows.values.max().map { $0 + 1 } ?? 1, 1)) * clipRowHeight
         let end = max(timeline.duration, clips.map(\.end).max() ?? 0)
-        let contentWidth = max(end * pointsPerSecond + 240, visibleRect.width)
+        let contentWidth = max(end * pointsPerSecond + Self.trailingSpace, visibleRect.width)
         let slideLaneHeight = slideRowHeight * 2 + 4
 
         VStack(spacing: 0) {
@@ -59,8 +70,47 @@ struct ShowTimelineView: View {
             }
             .scrollPosition($scrollPosition)
             .onScrollGeometryChange(for: CGRect.self, of: { $0.visibleRect }) { _, rect in visibleRect = rect }
+            .onChange(of: FitInputs(width: visibleRect.width, end: end), initial: true) { _, inputs in
+                guard inputs.width > 0 else { return }
+                fitPointsPerSecond = (inputs.width - Self.trailingSpace) / max(inputs.end, 1)
+            }
+            .onChange(of: pointsPerSecond) { old, new in
+                // Keep the playhead at the same place on screen while zooming.
+                let onScreen = playback.time * old - visibleRect.minX
+                scrollPosition.scrollTo(x: max(0, playback.time * new - onScreen))
+            }
         }
         .background(Color(nsColor: .textBackgroundColor))
+        .focusable()
+        .focused($focused)
+        .focusEffectDisabled()
+        .onDeleteCommand(perform: deleteSelection)
+        .onCommand(#selector(NSResponder.selectAll(_:)), perform: selectAll)
+        .onChange(of: selection) { _, photos in
+            if !photos.isEmpty { selectedClips = [] }
+        }
+    }
+
+    /// Selects every music clip if a clip is selected, otherwise every photo.
+    private func selectAll() {
+        if !selectedClips.isEmpty {
+            selectedClips = Set(document.show.audio.map(\.id))
+        } else {
+            selection = Set(document.show.slides.map(\.id))
+            if currentID == nil { currentID = document.show.slides.first?.id }
+        }
+    }
+
+    /// Deletes the selected music clips, or if there are none, the selected photos.
+    private func deleteSelection() {
+        if !selectedClips.isEmpty {
+            document.show.audio.removeAll { selectedClips.contains($0.id) }
+            selectedClips = []
+        } else if !selection.isEmpty {
+            document.removeSlides(selection)
+            selection = []
+            currentID = nil
+        }
     }
 
     // MARK: - Header and ruler
@@ -76,7 +126,10 @@ struct ShowTimelineView: View {
                 scrollPosition.scrollTo(x: x)
             }
             Image(systemName: "minus.magnifyingglass").foregroundStyle(.secondary)
-            Slider(value: $pointsPerSecond, in: 4...200).frame(width: 140)
+            Slider(value: $pointsPerSecond,
+                   in: fitPointsPerSecond...max(Self.maxPointsPerSecond, fitPointsPerSecond + 1))
+                .frame(width: 140)
+                .help("Zoom the timeline (= and -)")
             Image(systemName: "plus.magnifyingglass").foregroundStyle(.secondary)
         }
         .padding(.horizontal, 12)
@@ -88,19 +141,19 @@ struct ShowTimelineView: View {
             let pps = pointsPerSecond
             let labelEvery = [1.0, 2, 5, 10, 15, 30, 60, 120, 300, 600].first { $0 * pps >= 60 } ?? 600
             let tickEvery = labelEvery / 5
-            var t = 0.0
-            while t * pps <= size.width {
+            for i in 0...Int(size.width / (tickEvery * pps)) {
+                let t = Double(i) * tickEvery
                 let x = t * pps
-                let isLabel = abs((t / labelEvery).rounded() * labelEvery - t) < 1e-6
+                let isLabel = i.isMultiple(of: 5)
                 let tickHeight: CGFloat = isLabel ? 10 : 5
                 context.fill(Path(CGRect(x: x, y: size.height - tickHeight, width: 1, height: tickHeight)),
                              with: .color(.secondary))
                 if isLabel {
-                    let minutes = Int(t) / 60, seconds = Int(t) % 60
+                    let whole = Int(t.rounded())
+                    let minutes = whole / 60, seconds = whole % 60
                     context.draw(Text(String(format: "%d:%02d", minutes, seconds)).font(.caption2).foregroundStyle(.secondary),
                                  at: CGPoint(x: x + 3, y: 2), anchor: .topLeading)
                 }
-                t += tickEvery
             }
         }
         .frame(width: width, height: rulerHeight)
@@ -127,6 +180,7 @@ struct ShowTimelineView: View {
                     .offset(x: entry.start * pointsPerSecond,
                             y: entry.index.isMultiple(of: 2) ? 0 : slideRowHeight + 4)
                     .onTapGesture { select(slide.id, entry: entry) }
+                    .simultaneousGesture(TapGesture(count: 2).onEnded { onOpen(slide.id) })
                     .contextMenu {
                         Button("Reset Duration") { document.show.slides[entry.index].duration = nil }
                             .disabled(slide.duration == nil)
@@ -156,6 +210,8 @@ struct ShowTimelineView: View {
     }
 
     private func select(_ id: UUID, entry: ShowTimeline.Entry) {
+        focused = true
+        selectedClips = []
         if NSEvent.modifierFlags.contains(.command) {
             if selection.contains(id) { selection.remove(id) } else { selection.insert(id) }
         } else {
@@ -179,8 +235,9 @@ struct ShowTimelineView: View {
                     .frame(height: clipRowHeight)
             }
             ForEach(clips) { clip in
-                AudioBlock(clip: clip)
+                AudioBlock(clip: clip, isSelected: selectedClips.contains(clip.id))
                     .frame(width: max(clip.length * pointsPerSecond, 4), height: clipRowHeight - 4)
+                    .onTapGesture { selectClip(clip.id) }
                     .gesture(clipGesture(clip) { c, dt in c.start = max(0, c.start + dt) })
                     .overlay(alignment: .leading) {
                         trimHandle(clip, edge: .leading) { c, dt in
@@ -205,6 +262,16 @@ struct ShowTimelineView: View {
         } isTargeted: { audioTargeted = $0 }
     }
 
+    private func selectClip(_ id: UUID) {
+        focused = true
+        if NSEvent.modifierFlags.contains(.command) {
+            if selectedClips.contains(id) { selectedClips.remove(id) } else { selectedClips.insert(id) }
+        } else {
+            selectedClips = [id]
+        }
+        selection = []
+    }
+
     private func trimHandle(_ clip: AudioClip, edge: HorizontalEdge,
                             change: @escaping (inout AudioClip, Double) -> Void) -> some View {
         Rectangle()
@@ -218,6 +285,7 @@ struct ShowTimelineView: View {
     private func clipGesture(_ clip: AudioClip, change: @escaping (inout AudioClip, Double) -> Void) -> some Gesture {
         DragGesture(minimumDistance: 1, coordinateSpace: .named("timeline"))
             .onChanged { value in
+                if !selectedClips.contains(clip.id) { selectClip(clip.id) }
                 guard var edited = document.show.audio.first(where: { $0.id == clip.id }) else { return }
                 change(&edited, value.translation.width / pointsPerSecond)
                 clipEdit = edited
@@ -270,6 +338,11 @@ struct ShowTimelineView: View {
     }
 }
 
+private struct FitInputs: Equatable {
+    var width: CGFloat
+    var end: Double
+}
+
 private struct SlideBlock: View {
     let slide: Slide
     let entry: ShowTimeline.Entry
@@ -315,6 +388,7 @@ private struct SlideBlock: View {
 
 private struct AudioBlock: View {
     let clip: AudioClip
+    let isSelected: Bool
 
     var body: some View {
         HStack(spacing: 4) {
@@ -330,6 +404,10 @@ private struct AudioBlock: View {
         .padding(.horizontal, 6)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.green.opacity(0.7), in: RoundedRectangle(cornerRadius: 4))
+        .overlay {
+            RoundedRectangle(cornerRadius: 4)
+                .strokeBorder(isSelected ? Color.yellow : .clear, lineWidth: 2)
+        }
         .contentShape(Rectangle())
         .help(clip.name)
     }

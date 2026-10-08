@@ -12,6 +12,21 @@ final class PlaybackController {
     var duration: Double = 0 {
         didSet { if time > duration { time = max(duration, 0) } }
     }
+    static let maxSpeed = 8.0
+    /// Playback rate, 1× to 8×. Music plays up to 2× and is muted when faster.
+    var speed: Double = 1 {
+        didSet {
+            guard speed != oldValue else { return }
+            if isPlaying {
+                let now = (anchorTime + (CACurrentMediaTime() - anchorHostTime) * oldValue)
+                start(from: min(max(now, 0), duration))
+            }
+        }
+    }
+
+    func changeSpeed(by step: Double) {
+        speed = min(max(speed + step, 1), Self.maxSpeed)
+    }
 
     @ObservationIgnored private var anchorTime: Double = 0
     @ObservationIgnored private var anchorHostTime: CFTimeInterval = 0
@@ -25,7 +40,7 @@ final class PlaybackController {
 
     var currentTime: Double {
         guard isPlaying else { return time }
-        return min(max(anchorTime + CACurrentMediaTime() - anchorHostTime, 0), duration)
+        return min(max(anchorTime + (CACurrentMediaTime() - anchorHostTime) * speed, 0), duration)
     }
 
     func togglePlay() {
@@ -68,6 +83,7 @@ final class PlaybackController {
         if wasPlaying { pause() }
         if let (composition, mix) = audio {
             let item = AVPlayerItem(asset: composition)
+            item.audioTimePitchAlgorithm = .spectral
             item.audioMix = mix
             player.replaceCurrentItem(with: item)
             hasAudio = true
@@ -84,7 +100,8 @@ final class PlaybackController {
         anchorTime = t
         anchorHostTime = hostTime
         if hasAudio {
-            player.setRate(1, time: AudioComposer.cmTime(t),
+            player.isMuted = speed > 2
+            player.setRate(Float(speed), time: AudioComposer.cmTime(t),
                            atHostTime: CMTime(seconds: hostTime, preferredTimescale: 1_000_000_000))
         }
     }
