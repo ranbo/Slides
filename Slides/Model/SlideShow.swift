@@ -111,6 +111,18 @@ extension Slide {
         crop ?? FrameMath.fillRect(imageAspect: imageAspect, outputAspect: settings.outputAspect)
     }
 
+    /// Whether the crop is still the default, or zoomed all the way out to the whole photo,
+    /// rather than set by hand.
+    func hasUneditedCrop(_ settings: ShowSettings) -> Bool {
+        guard let crop else { return true }
+        let defaults = [FrameMath.fillRect(imageAspect: imageAspect, outputAspect: settings.outputAspect),
+                        FrameMath.fitRect(imageAspect: imageAspect, outputAspect: settings.outputAspect)]
+        return defaults.contains { rect in
+            abs(crop.x - rect.x) < 0.001 && abs(crop.y - rect.y) < 0.001
+                && abs(crop.width - rect.width) < 0.001 && abs(crop.height - rect.height) < 0.001
+        }
+    }
+
     func focusPoint(_ settings: ShowSettings) -> CGPoint {
         let outer = maxCrop(settings)
         return outer.clamping(focus ?? outer.center)

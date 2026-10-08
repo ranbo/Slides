@@ -25,6 +25,13 @@ struct ShowMenuCommands: Commands {
             Button("Normal Speed") { show?.playback.speed = 1 }
                 .keyboardShortcut("\\", modifiers: [])
         }
+        CommandMenu("Photos") {
+            Group {
+                Button("Trim White Borders") { show?.trimBorders() }
+                Button("Find Faces") { show?.findFaces() }
+            }
+            .disabled(show?.hasPhotoSelection != true)
+        }
         CommandGroup(after: .toolbar) {
             Button("Zoom In Timeline") { show?.zoomTimeline(ShowTimelineView.zoomStep) }
                 .keyboardShortcut("=", modifiers: [])

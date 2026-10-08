@@ -7,15 +7,37 @@ struct DropMarker: Equatable {
     var after: Bool
 }
 
+/// A click on a photo in the grid or the timeline. A plain click selects just that photo,
+/// ⌘-click adds or removes it, and Shift-click selects the run of photos from the anchor
+/// (the last photo clicked without Shift) to it. Returns whether the photo ends up selected.
+@MainActor
+func clickSelect(_ id: UUID, in slides: [Slide], selection: inout Set<UUID>, anchor: inout UUID?) -> Bool {
+    let flags = NSApp.currentEvent?.modifierFlags ?? NSEvent.modifierFlags
+    if flags.contains(.shift), let anchorID = anchor,
+       let a = slides.firstIndex(where: { $0.id == anchorID }),
+       let b = slides.firstIndex(where: { $0.id == id }) {
+        let run = Set(slides[min(a, b)...max(a, b)].map(\.id))
+        selection = flags.contains(.command) ? selection.union(run) : run
+    } else if flags.contains(.command) || flags.contains(.shift) {
+        if selection.contains(id) { selection.remove(id) } else { selection.insert(id) }
+        anchor = id
+    } else {
+        selection = [id]
+        anchor = id
+    }
+    return selection.contains(id)
+}
+
 struct PhotoGridView: View {
     @Binding var document: SlideShowDocument
     @Binding var selection: Set<UUID>
     @Binding var currentID: UUID?
+    /// Where a Shift-click range starts; shared with the timeline.
+    @Binding var anchorID: UUID?
     var onAddPhotos: (_ urls: [URL], _ index: Int) -> Void
     /// Double-click: edit this photo.
     var onOpen: (UUID) -> Void
 
-    @State private var anchorID: UUID?
     @State private var draggedIDs: Set<UUID> = []
     @State private var marker: DropMarker?
     @FocusState private var focused: Bool
@@ -81,19 +103,7 @@ struct PhotoGridView: View {
 
     private func click(_ id: UUID) {
         focused = true
-        let flags = NSEvent.modifierFlags
-        if flags.contains(.command) {
-            if selection.contains(id) { selection.remove(id) } else { selection.insert(id) }
-            anchorID = id
-        } else if flags.contains(.shift), let anchorID,
-                  let a = slides.firstIndex(where: { $0.id == anchorID }),
-                  let b = slides.firstIndex(where: { $0.id == id }) {
-            selection = Set(slides[min(a, b)...max(a, b)].map(\.id))
-        } else {
-            selection = [id]
-            anchorID = id
-        }
-        currentID = id
+        if clickSelect(id, in: slides, selection: &selection, anchor: &anchorID) { currentID = id }
     }
 
     /// Selected slides in show order.
@@ -289,26 +299,33 @@ private struct GridCell: View {
     }
 }
 
-/// The photo shown through its maximum crop, at the output's aspect ratio.
+/// The photo shown through its maximum crop, at the output's aspect ratio, or with `fill`,
+/// filling whatever space it's given (cropping the crop further, around its center).
 struct CroppedThumbnail: View {
     let slide: Slide
     let settings: ShowSettings
+    var fill = false
     @State private var image: NSImage?
     @State private var missing = false
 
     var body: some View {
         Color.black
-            .aspectRatio(settings.outputAspect, contentMode: .fit)
+            .fitting(aspectRatio: fill ? nil : settings.outputAspect)
             .overlay(alignment: .topLeading) {
                 GeometryReader { geo in
                     if let image {
                         let crop = slide.maxCrop(settings)
-                        let width = geo.size.width / crop.width
-                        let height = geo.size.height / crop.height
+                        // The crop's on-screen size: covering the space, keeping its shape.
+                        let aspect = settings.outputAspect
+                        let cropWidth = max(geo.size.width, geo.size.height * aspect)
+                        let cropHeight = cropWidth / aspect
+                        let width = cropWidth / crop.width
+                        let height = cropHeight / crop.height
                         Image(nsImage: image)
                             .resizable()
                             .frame(width: width, height: height)
-                            .offset(x: -crop.x * width, y: -crop.y * height)
+                            .offset(x: (geo.size.width - cropWidth) / 2 - crop.x * width,
+                                    y: (geo.size.height - cropHeight) / 2 - crop.y * height)
                     } else if missing {
                         Label("Missing", systemImage: "exclamationmark.triangle.fill")
                             .font(.caption)
@@ -322,5 +339,13 @@ struct CroppedThumbnail: View {
                 image = await ThumbnailCache.grid.image(for: slide.source)
                 missing = image == nil
             }
+    }
+}
+
+private extension View {
+    /// Fits the view to the aspect ratio, or with nil, leaves it to take the space it's given.
+    /// (`aspectRatio(nil, ...)` isn't the same: it squares a view with no natural size.)
+    @ViewBuilder func fitting(aspectRatio ratio: Double?) -> some View {
+        if let ratio { aspectRatio(ratio, contentMode: .fit) } else { self }
     }
 }

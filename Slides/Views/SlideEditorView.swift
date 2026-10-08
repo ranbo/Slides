@@ -10,6 +10,10 @@ struct SlideEditorView: View {
     let allEmbedded: Bool
     /// Applies a change to every photo being edited, as one undo step.
     var apply: ((inout Slide) -> Void) -> Void
+    /// Set while photos are being analyzed, e.g. "Finding faces… 37 of 305".
+    let analysisProgress: String?
+    var onFindFaces: () -> Void
+    var onTrimBorders: () -> Void
     var onCopyIntoDocument: () -> Void
     var onPreview: () -> Void
 
@@ -77,6 +81,9 @@ struct SlideEditorView: View {
                         }
                     }
                     .help("Show the entire photo, with black bars")
+                    Button("Trim Borders", action: onTrimBorders)
+                        .disabled(analysisProgress != nil)
+                        .help("Crop off the white border of a scanned print, top and bottom or the sides")
                 }
             }
             Spacer(minLength: 0)
@@ -115,9 +122,18 @@ struct SlideEditorView: View {
                     .help("Use the default zoom, centered")
             }
         }
-        Button("Center Focus") { apply { $0.focus = nil } }
-            .disabled(!multiple && slide.focus == nil)
-            .help("Drag the crosshair to choose what the zoom closes in on. Shift-drag in the picture to move the inner rectangle.")
+        HStack {
+            Button("Center Focus") { apply { $0.focus = nil } }
+                .disabled(!multiple && slide.focus == nil)
+                .help("Drag the crosshair to choose what the zoom closes in on. Shift-drag in the picture to move the inner rectangle.")
+            if let analysisProgress {
+                ProgressView().controlSize(.small)
+                Text(analysisProgress).foregroundStyle(.secondary).fixedSize()
+            } else {
+                Button("Find Faces", action: onFindFaces)
+                    .help("Aim the zoom at the faces in the photo (between them, if there are several)")
+            }
+        }
     }
 
     @ViewBuilder

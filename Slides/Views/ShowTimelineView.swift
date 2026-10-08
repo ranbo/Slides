@@ -6,6 +6,8 @@ struct ShowTimelineView: View {
     @Binding var document: SlideShowDocument
     @Binding var selection: Set<UUID>
     @Binding var currentID: UUID?
+    /// Where a Shift-click range starts; shared with the photo grid.
+    @Binding var anchorID: UUID?
     let playback: PlaybackController
     /// Timeline zoom level.
     @Binding var pointsPerSecond: Double
@@ -74,6 +76,11 @@ struct ShowTimelineView: View {
                 guard inputs.width > 0 else { return }
                 fitPointsPerSecond = (inputs.width - Self.trailingSpace) / max(inputs.end, 1)
             }
+            .onChange(of: currentID) { _, id in
+                // Keep the photo being edited in view, e.g. when stepping with the arrow keys.
+                guard !playback.isPlaying, let id, let entry = timeline.entry(for: id) else { return }
+                reveal(entry)
+            }
             .onChange(of: pointsPerSecond) { old, new in
                 // Keep the playhead at the same place on screen while zooming.
                 let onScreen = playback.time * old - visibleRect.minX
@@ -88,6 +95,19 @@ struct ShowTimelineView: View {
         .onCommand(#selector(NSResponder.selectAll(_:)), perform: selectAll)
         .onChange(of: selection) { _, photos in
             if !photos.isEmpty { selectedClips = [] }
+        }
+    }
+
+    /// Scrolls just enough to show the whole photo (or its start, if it's wider than the view).
+    private func reveal(_ entry: ShowTimeline.Entry) {
+        guard visibleRect.width > 0 else { return }
+        let margin = 24.0
+        let minX = entry.start * pointsPerSecond - margin
+        let maxX = (entry.start + entry.duration) * pointsPerSecond + margin
+        if minX < visibleRect.minX {
+            scrollPosition.scrollTo(x: max(0, minX))
+        } else if maxX > visibleRect.maxX {
+            scrollPosition.scrollTo(x: max(0, min(maxX - visibleRect.width, minX)))
         }
     }
 
@@ -212,13 +232,9 @@ struct ShowTimelineView: View {
     private func select(_ id: UUID, entry: ShowTimeline.Entry) {
         focused = true
         selectedClips = []
-        if NSEvent.modifierFlags.contains(.command) {
-            if selection.contains(id) { selection.remove(id) } else { selection.insert(id) }
-        } else {
-            selection = [id]
-        }
+        guard clickSelect(id, in: document.show.slides, selection: &selection, anchor: &anchorID) else { return }
+        // Moving the playhead to the photo happens when it becomes the current photo.
         currentID = id
-        if !playback.isPlaying { playback.seek(to: entry.start + entry.fadeIn) }
     }
 
     // MARK: - Music
@@ -352,22 +368,18 @@ private struct SlideBlock: View {
 
     var body: some View {
         let color: Color = entry.index.isMultiple(of: 2) ? .blue : .purple
-        HStack(spacing: 6) {
-            CroppedThumbnail(slide: slide, settings: settings)
-                .frame(height: 36)
-                .clipShape(RoundedRectangle(cornerRadius: 2))
-            VStack(alignment: .leading, spacing: 1) {
-                Text("\(entry.index + 1)").font(.caption.bold())
-                Text(String(format: "%.1fs", entry.duration))
-                    .font(.caption2.monospacedDigit())
-                    .fontWeight(slide.duration == nil ? .regular : .bold)
+        let width = entry.duration * pointsPerSecond
+        CroppedThumbnail(slide: slide, settings: settings, fill: true)
+            .clipShape(RoundedRectangle(cornerRadius: 2))
+            .padding(2)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(color)
+            .overlay(alignment: .topTrailing) {
+                if width >= 30 { badge("\(entry.index + 1)", bold: true) }
             }
-            .foregroundStyle(.white)
-            Spacer(minLength: 0)
-        }
-        .padding(.horizontal, 5)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-        .background(color.opacity(0.75))
+            .overlay(alignment: .bottomTrailing) {
+                if width >= 44 { badge(String(format: "%.1fs", entry.duration), bold: slide.duration != nil) }
+            }
         .overlay(alignment: .leading) {
             LinearGradient(colors: [.black.opacity(0.6), .clear], startPoint: .leading, endPoint: .trailing)
                 .frame(width: entry.fadeIn * pointsPerSecond)
@@ -383,6 +395,16 @@ private struct SlideBlock: View {
         }
         .contentShape(Rectangle())
         .help(slide.name)
+    }
+
+    private func badge(_ text: String, bold: Bool) -> some View {
+        Text(text)
+            .font(.caption2.monospacedDigit())
+            .fontWeight(bold ? .bold : .regular)
+            .foregroundStyle(.white)
+            .padding(.horizontal, 3)
+            .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 3))
+            .padding(3)
     }
 }
 

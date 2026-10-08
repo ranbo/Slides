@@ -12,12 +12,16 @@ struct ContentView: View {
 
     @State private var selection: Set<UUID> = []
     @State private var currentID: UUID?
+    /// Where a Shift-click range starts.
+    @State private var anchorID: UUID?
     @State private var mode: EditorMode = .edit
     @State private var playback = PlaybackController()
     @State private var showingSettings = false
     @State private var export: ExportProgress?
     /// Playback was started from Edit mode, so stopping returns there.
     @State private var returnToEdit = false
+    /// Progress of a photo analysis in progress, e.g. "Finding faces… 37 of 305".
+    @State private var analysisProgress: String?
     @AppStorage("timelineHeight") private var timelineHeight = 210.0
     @AppStorage("timelinePointsPerSecond") private var pointsPerSecond = 40.0
     @State private var fitPointsPerSecond = 1.0
@@ -32,7 +36,7 @@ struct ContentView: View {
             VStack(spacing: 0) {
                 HSplitView {
                     PhotoGridView(document: $document, selection: $selection, currentID: $currentID,
-                                  onAddPhotos: addPhotos, onOpen: openInEditor)
+                                  anchorID: $anchorID, onAddPhotos: addPhotos, onOpen: openInEditor)
                         .frame(minWidth: 240, idealWidth: 380)
                     mainPane
                         .frame(minWidth: 480, maxWidth: .infinity, maxHeight: .infinity)
@@ -40,14 +44,18 @@ struct ContentView: View {
                 .frame(maxHeight: .infinity)
                 SplitHandle(height: $timelineHeight, range: 120...maxTimeline)
                 ShowTimelineView(document: $document, selection: $selection, currentID: $currentID,
-                                 playback: playback, pointsPerSecond: $pointsPerSecond,
+                                 anchorID: $anchorID, playback: playback, pointsPerSecond: $pointsPerSecond,
                                  fitPointsPerSecond: $fitPointsPerSecond,
                                  onSeek: { mode = .preview }, onOpen: openInEditor, onAddAudio: addAudio)
                     .frame(height: min(max(timelineHeight, 120), maxTimeline))
             }
         }
         .background { hiddenShortcuts }
-        .focusedSceneValue(\.showCommands, ShowCommands(playback: playback, zoomTimeline: zoomTimeline))
+        .focusedSceneValue(\.showCommands, ShowCommands(
+            playback: playback, zoomTimeline: zoomTimeline,
+            hasPhotoSelection: !menuTargets.isEmpty && analysisProgress == nil,
+            trimBorders: { Task { await trimBorders(in: menuTargets) } },
+            findFaces: { Task { await findFaces(in: menuTargets, replacingFocus: true) } }))
         .toolbar { toolbar }
         .sheet(item: $export) { progress in
             ExportSheet(progress: progress) { export = nil }
@@ -59,9 +67,14 @@ struct ContentView: View {
         .onAppear { playback.duration = timeline.duration }
         .onChange(of: timeline.duration) { _, duration in playback.duration = duration }
         .onChange(of: currentID) { _, id in
-            // In preview, picking a photo jumps to it.
-            guard mode == .preview, !playback.isPlaying, let id, let entry = timeline.entry(for: id) else { return }
-            playback.seek(to: entry.start + entry.fadeIn)
+            // Picking a photo moves the playhead to it: in Edit mode to where it starts, and in
+            // preview to where it's fully faded in.
+            guard !playback.isPlaying, let id, let entry = timeline.entry(for: id) else { return }
+            playback.seek(to: mode == .preview ? entry.start + entry.fadeIn : entry.start)
+        }
+        .onChange(of: selection) { _, ids in
+            // Whatever selects a single photo (a click, the arrow keys) starts a new Shift-click range.
+            if ids.count == 1 { anchorID = ids.first }
         }
         .task(id: AudioKey(clips: show.audio, fadeOut: show.settings.musicFadeOut, duration: timeline.duration)) {
             let audio = await AudioComposer.build(show: show, totalDuration: timeline.duration)
@@ -80,6 +93,9 @@ struct ContentView: View {
                                 editCount: ids.count,
                                 allEmbedded: show.slides.filter { ids.contains($0.id) }.allSatisfy(\.source.isEmbedded),
                                 apply: { change in applyToSlides(ids, change) },
+                                analysisProgress: analysisProgress,
+                                onFindFaces: { Task { await findFaces(in: ids, replacingFocus: true) } },
+                                onTrimBorders: { Task { await trimBorders(in: ids) } },
                                 onCopyIntoDocument: { document.embedMedia(slideIDs: ids, clipIDs: []) },
                                 onPreview: { previewSlide(at: index) })
                     // A fresh editor per photo, so no half-finished edit carries over.
@@ -199,16 +215,17 @@ struct ContentView: View {
                               max(ShowTimelineView.maxPointsPerSecond, fitPointsPerSecond))
     }
 
-    /// Selects the previous or next photo. In a text field, the arrow keys move the cursor instead.
+    /// Selects the previous or next photo.
     private func stepPhoto(by step: Int) {
-        if let textView = NSApp.keyWindow?.firstResponder as? NSTextView {
-            step < 0 ? textView.moveLeft(nil) : textView.moveRight(nil)
-            return
-        }
+        // Finish any typing in a text box first, so it's saved to the photo it was typed for.
+        // (macOS also tends to put focus in the Duration box when a photo opens, so the
+        // arrows can't be left to text boxes.)
+        NSApp.keyWindow?.makeFirstResponder(nil)
         let slides = show.slides
         guard !slides.isEmpty else { return }
         let index = slides.firstIndex { $0.id == currentID }
             .map { min(max($0 + step, 0), slides.count - 1) } ?? (step > 0 ? 0 : slides.count - 1)
+        // The playhead follows, to the start of the photo (see onChange of currentID).
         currentID = slides[index].id
         selection = [slides[index].id]
     }
@@ -253,6 +270,53 @@ struct ContentView: View {
         document = updated
         selection = Set(slides.map(\.id))
         currentID = slides.first?.id
+        Task { await findFaces(in: Set(slides.map(\.id)), replacingFocus: false) }
+    }
+
+    /// Aims each photo's zoom at its faces. Unless `replacingFocus`, photos whose focus has
+    /// been set by hand are left alone. All the changes are one undo step.
+    private func findFaces(in ids: Set<UUID>, replacingFocus: Bool) async {
+        let photos = show.slides.filter { ids.contains($0.id) && (replacingFocus || $0.focus == nil) }
+        guard let points = await analyze(photos, label: "Finding faces", FaceFinder.focusPoint) else { return }
+        applyToSlides(Set(points.keys)) { slide in
+            if replacingFocus || slide.focus == nil { slide.focus = points[slide.id] }
+        }
+    }
+
+    /// Crops the white border off scanned prints, along one axis. Photos without a border
+    /// are left alone, and so, when trimming several, are photos already cropped by hand.
+    /// All the changes are one undo step.
+    private func trimBorders(in ids: Set<UUID>) async {
+        let settings = show.settings
+        let photos = show.slides.filter { ids.contains($0.id) && (ids.count == 1 || $0.hasUneditedCrop(settings)) }
+        guard let content = await analyze(photos, label: "Trimming borders", BorderFinder.contentRect) else { return }
+        let outputAspect = show.settings.outputAspect
+        applyToSlides(Set(content.keys)) { slide in
+            guard let rect = content[slide.id] else { return }
+            slide.crop = BorderFinder.trimmedCrop(content: rect, imageAspect: slide.imageAspect, outputAspect: outputAspect)
+            slide.panStart = nil
+            slide.panEnd = nil
+        }
+    }
+
+    /// Runs `analysis` on each photo in the background, a few at a time, showing progress.
+    /// Returns the non-nil results, or nil if there was nothing to do or another analysis is running.
+    private func analyze<Result: Sendable>(_ slides: [Slide], label: String,
+                                           _ analysis: @escaping @Sendable (URL) -> Result?) async -> [UUID: Result]? {
+        guard analysisProgress == nil else { return nil }
+        let photos = slides.compactMap { slide in MediaStore.url(for: slide.source).map { (id: slide.id, url: $0) } }
+        guard !photos.isEmpty else { return nil }
+        analysisProgress = "\(label)… 0 of \(photos.count)"
+        let results = await PhotoAnalysis.run(photos, analysis) { done in
+            analysisProgress = "\(label)… \(done) of \(photos.count)"
+        }
+        analysisProgress = nil
+        return results.isEmpty ? nil : results
+    }
+
+    /// What the Photos menu acts on: the selected photos, or the one being edited.
+    private var menuTargets: Set<UUID> {
+        selection.isEmpty ? editTargets : selection
     }
 
     private func addAudio(_ urls: [URL], at time: Double) {
@@ -375,6 +439,9 @@ struct SplitHandle: View {
 struct ShowCommands {
     var playback: PlaybackController
     var zoomTimeline: (Double) -> Void
+    var hasPhotoSelection: Bool
+    var trimBorders: () -> Void
+    var findFaces: () -> Void
 }
 
 extension FocusedValues {
