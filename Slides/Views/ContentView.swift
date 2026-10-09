@@ -14,6 +14,11 @@ struct ContentView: View {
     @State private var currentID: UUID?
     /// Where a Shift-click range starts.
     @State private var anchorID: UUID?
+    @State private var selectedClips: Set<UUID> = []
+    /// The music clip shown in Edit mode instead of a photo.
+    @State private var editingClipID: UUID?
+    /// Playback was started from the music editor, so stopping returns to it.
+    @State private var returnToClip: UUID?
     @State private var mode: EditorMode = .edit
     @State private var playback = PlaybackController()
     @State private var showingSettings = false
@@ -25,6 +30,9 @@ struct ContentView: View {
     @AppStorage("timelineHeight") private var timelineHeight = 210.0
     @AppStorage("timelinePointsPerSecond") private var pointsPerSecond = 40.0
     @State private var fitPointsPerSecond = 1.0
+    /// Bumped to rebuild the music, e.g. in case songs were moved while the app was in the background.
+    @State private var audioGeneration = 0
+    @Environment(\.openWindow) private var openWindow
 
     private var show: SlideShow { document.show }
 
@@ -44,10 +52,12 @@ struct ContentView: View {
                 .frame(maxHeight: .infinity)
                 SplitHandle(height: $timelineHeight, range: 120...maxTimeline)
                 ShowTimelineView(document: $document, selection: $selection, currentID: $currentID,
-                                 anchorID: $anchorID, playback: playback, pointsPerSecond: $pointsPerSecond,
+                                 anchorID: $anchorID, selectedClips: $selectedClips, playback: playback, pointsPerSecond: $pointsPerSecond,
                                  fitPointsPerSecond: $fitPointsPerSecond,
-                                 onSeek: { mode = .preview }, onOpen: openInEditor, onAddAudio: addAudio)
+                                 onSeek: { mode = .preview }, onOpen: openInEditor, onOpenClip: openClipEditor,
+                                 onAddAudio: addAudio)
                     .frame(height: min(max(timelineHeight, 120), maxTimeline))
+                    .clipped()
             }
         }
         .background { hiddenShortcuts }
@@ -55,7 +65,11 @@ struct ContentView: View {
             playback: playback, zoomTimeline: zoomTimeline,
             hasPhotoSelection: !menuTargets.isEmpty && analysisProgress == nil,
             trimBorders: { Task { await trimBorders(in: menuTargets) } },
-            findFaces: { Task { await findFaces(in: menuTargets, replacingFocus: true) } }))
+            findFaces: { Task { await findFaces(in: menuTargets, replacingFocus: true) } },
+            // Not whether any clip is under the playhead: reading the time here would
+            // redraw the whole window every frame during playback.
+            canSplitMusic: !show.audio.isEmpty,
+            splitMusic: splitMusic))
         .toolbar { toolbar }
         .sheet(item: $export) { progress in
             ExportSheet(progress: progress) { export = nil }
@@ -72,11 +86,21 @@ struct ContentView: View {
             guard !playback.isPlaying, let id, let entry = timeline.entry(for: id) else { return }
             playback.seek(to: mode == .preview ? entry.start + entry.fadeIn : entry.start)
         }
+        .onChange(of: selectedClips) { _, ids in
+            // In Edit mode, clicking a music clip edits it; selecting photos goes back to them.
+            if ids.isEmpty { editingClipID = nil }
+            else if mode == .edit, ids.count == 1 { editingClipID = ids.first }
+            else if let id = editingClipID, !ids.contains(id) { editingClipID = nil }
+        }
         .onChange(of: selection) { _, ids in
             // Whatever selects a single photo (a click, the arrow keys) starts a new Shift-click range.
             if ids.count == 1 { anchorID = ids.first }
         }
-        .task(id: AudioKey(clips: show.audio, fadeOut: show.settings.musicFadeOut, duration: timeline.duration)) {
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            if !playback.isPlaying { audioGeneration += 1 }
+        }
+        .task(id: AudioKey(clips: show.audio, fadeOut: show.settings.musicFadeOut, duration: timeline.duration,
+                           generation: audioGeneration)) {
             let audio = await AudioComposer.build(show: show, totalDuration: timeline.duration)
             guard !Task.isCancelled else { return }
             playback.setAudio(audio)
@@ -87,7 +111,13 @@ struct ContentView: View {
     private var mainPane: some View {
         switch mode {
         case .edit:
-            if let index = show.slides.firstIndex(where: { $0.id == currentID }) {
+            if let clipID = editingClipID, let clip = show.audio.first(where: { $0.id == clipID }) {
+                let ids = selectedClips.contains(clipID) ? selectedClips : [clipID]
+                AudioClipEditorView(clip: clip, editCount: ids.count,
+                                    apply: { change in applyToClips(ids, change) },
+                                    onPlay: { time in play(from: time, returningToClip: clipID) })
+                    .id(clipID)
+            } else if let index = show.slides.firstIndex(where: { $0.id == currentID }) {
                 let ids = editTargets
                 SlideEditorView(slide: slideBinding(show.slides[index]), index: index, settings: show.settings,
                                 editCount: ids.count,
@@ -147,6 +177,8 @@ struct ContentView: View {
             Button("Export", systemImage: "square.and.arrow.up", action: startExport)
                 .help("Export a movie")
                 .disabled(show.slides.isEmpty)
+            Button("Help", systemImage: "questionmark.circle") { openWindow(id: HelpView.windowID) }
+                .help("How Slides works, and keyboard shortcuts (⌘?)")
         }
     }
 
@@ -178,6 +210,15 @@ struct ContentView: View {
         document = updated
     }
 
+    /// Changes several music clips as a single undo step.
+    private func applyToClips(_ ids: Set<UUID>, _ change: (inout AudioClip) -> Void) {
+        var updated = document
+        for i in updated.show.audio.indices where ids.contains(updated.show.audio[i].id) {
+            change(&updated.show.audio[i])
+        }
+        document = updated
+    }
+
     // MARK: - Actions
 
     /// Plays in Preview mode. Started from Edit mode, it plays from the photo being edited, and
@@ -186,12 +227,17 @@ struct ContentView: View {
         let timeline = ShowTimeline(show: show)
         if playback.isPlaying {
             playback.pause()
-            if returnToEdit, let entry = timeline.entry(at: playback.time) {
+            if let clipID = returnToClip {
+                openClipEditor(clipID)
+            } else if returnToEdit, let entry = timeline.entry(at: playback.time) {
                 mode = .edit
                 currentID = entry.id
                 selection = [entry.id]
             }
             returnToEdit = false
+            returnToClip = nil
+        } else if mode == .edit, let clipID = editingClipID, let clip = show.audio.first(where: { $0.id == clipID }) {
+            play(from: clip.start, returningToClip: clipID)
         } else {
             returnToEdit = mode == .edit
             if mode == .edit, let currentID, let entry = timeline.entry(for: currentID) {
@@ -205,9 +251,31 @@ struct ContentView: View {
     private func openInEditor(_ id: UUID) {
         if playback.isPlaying { playback.pause() }
         returnToEdit = false
+        returnToClip = nil
+        editingClipID = nil
         mode = .edit
         currentID = id
         if !selection.contains(id) { selection = [id] }
+    }
+
+    private func openClipEditor(_ id: UUID) {
+        if playback.isPlaying { playback.pause() }
+        returnToEdit = false
+        returnToClip = nil
+        mode = .edit
+        selection = []
+        selectedClips = [id]
+        editingClipID = id
+    }
+
+    /// Plays from a time in the show; stopping goes back to editing the music clip.
+    private func play(from time: Double, returningToClip clipID: UUID) {
+        playback.pause()
+        returnToEdit = false
+        returnToClip = clipID
+        mode = .preview
+        playback.seek(to: time)
+        playback.play()
     }
 
     private func zoomTimeline(by factor: Double) {
@@ -319,6 +387,36 @@ struct ContentView: View {
         selection.isEmpty ? editTargets : selection
     }
 
+    /// The music clips ⌘B splits: the selected clips under the playhead, or if none of
+    /// them are, every clip under it. Not too near either end, so no tiny clip is left.
+    private var clipsToSplit: Set<UUID> {
+        let t = playback.time
+        let under = show.audio.filter { t > $0.start + 0.05 && t < $0.end - 0.05 }
+        let selected = under.filter { selectedClips.contains($0.id) }
+        return Set((selected.isEmpty ? under : selected).map(\.id))
+    }
+
+    /// Splits music at the playhead into a clip ending there and one starting there,
+    /// as one undo step. Neither half is selected, ready to click the one to change or delete.
+    private func splitMusic() {
+        let ids = clipsToSplit
+        guard !ids.isEmpty else { NSSound.beep(); return }
+        let t = playback.time
+        var updated = document
+        for i in updated.show.audio.indices.reversed() where ids.contains(updated.show.audio[i].id) {
+            var second = updated.show.audio[i]
+            let firstLength = t - second.start
+            updated.show.audio[i].length = firstLength
+            second.id = UUID()
+            second.start = t
+            second.offset += firstLength
+            second.length -= firstLength
+            updated.show.audio.insert(second, at: i + 1)
+        }
+        document = updated
+        selectedClips = []
+    }
+
     private func addAudio(_ urls: [URL], at time: Double) {
         let files = MediaStore.expand(urls, keeping: MediaStore.isAudio)
         guard !files.isEmpty else { NSSound.beep(); return }
@@ -377,6 +475,7 @@ private struct AudioKey: Hashable {
     var clips: [AudioClip]
     var fadeOut: Double
     var duration: Double
+    var generation: Int
 }
 
 struct TransportBar: View {
@@ -442,6 +541,8 @@ struct ShowCommands {
     var hasPhotoSelection: Bool
     var trimBorders: () -> Void
     var findFaces: () -> Void
+    var canSplitMusic: Bool
+    var splitMusic: () -> Void
 }
 
 extension FocusedValues {

@@ -21,7 +21,11 @@ enum MediaStore {
         case .embedded(let name):
             return embeddedDirectory.appendingPathComponent(name)
         case .file(let path, let bookmark):
-            if let cached = resolved.withLock({ $0[source] }) { return cached }
+            // The file may have moved since it was found (into another folder, say), so a
+            // remembered location is only used while the file is still there.
+            if let cached = resolved.withLock({ $0[source] }), FileManager.default.fileExists(atPath: cached.path) {
+                return cached
+            }
             var url: URL?
             if FileManager.default.fileExists(atPath: path) {
                 url = URL(fileURLWithPath: path)

@@ -26,15 +26,29 @@ enum AudioComposer {
                 continue
             }
 
-            let volume = Float(clip.volume)
             let input = AVMutableAudioMixInputParameters(track: track)
-            input.setVolume(volume, at: .zero)
+            // The mix turns the music down and fades it; a tap makes it louder.
+            let volume = Float(min(clip.volume, 1))
+            if clip.volume > 1.001 {
+                input.audioTapProcessor = GainTap.make(gain: Float(clip.volume))
+            }
             let end = start + length
-            if fade > 0, end > total - fade {
-                let fadeStart = max(start, total - fade)
-                func level(_ t: Double) -> Float { volume * Float(min(max((total - t) / fade, 0), 1)) }
-                input.setVolumeRamp(fromStartVolume: level(fadeStart), toEndVolume: level(end),
-                                    timeRange: CMTimeRange(start: cmTime(fadeStart), end: cmTime(end)))
+            let fadeIn = clip.fadeInDuration, fadeOut = clip.fadeOutDuration
+            /// The clip's own fades, times the fade at the end of the show.
+            func level(_ t: Double) -> Float {
+                var gain = 1.0
+                if fadeIn > 0 { gain *= min(max((t - clip.start) / fadeIn, 0), 1) }
+                if fadeOut > 0 { gain *= min(max((clip.end - t) / fadeOut, 0), 1) }
+                if fade > 0 { gain *= min(max((total - t) / fade, 0), 1) }
+                return volume * Float(gain)
+            }
+            // Straight-line ramps between the points where a fade starts or stops.
+            let points = Set([start, clip.start + fadeIn, clip.end - fadeOut, total - fade, end]
+                .filter { $0 >= start && $0 <= end }).sorted()
+            input.setVolume(level(start), at: cmTime(start))
+            for (a, b) in zip(points, points.dropFirst()) where b - a > 0.001 && level(a) != level(b) {
+                input.setVolumeRamp(fromStartVolume: level(a), toEndVolume: level(b),
+                                    timeRange: CMTimeRange(start: cmTime(a), end: cmTime(b)))
             }
             parameters.append(input)
         }

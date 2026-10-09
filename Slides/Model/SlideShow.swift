@@ -59,9 +59,37 @@ struct AudioClip: Codable, Hashable, Identifiable {
     var offset: Double = 0
     var length: Double
     var fileDuration: Double
+    /// Gain, as a multiplier: below 1 is quieter, above 1 louder.
     var volume: Double = 1
+    /// Seconds to fade in and out. nil fades automatically: only an end that's been trimmed,
+    /// so the music doesn't cut off abruptly there.
+    var fadeIn: Double?
+    var fadeOut: Double?
 
     var end: Double { start + length }
+}
+
+extension AudioClip {
+    static let automaticFade = 0.5
+    static let gainRange = -24.0...12.0
+
+    var isTrimmedAtStart: Bool { offset > 0.01 }
+    var isTrimmedAtEnd: Bool { offset + length < fileDuration - 0.01 }
+
+    /// The fades actually used, kept to half the clip each so they never overlap.
+    var fadeInDuration: Double {
+        min(max(fadeIn ?? (isTrimmedAtStart ? Self.automaticFade : 0), 0), length / 2)
+    }
+
+    var fadeOutDuration: Double {
+        min(max(fadeOut ?? (isTrimmedAtEnd ? Self.automaticFade : 0), 0), length / 2)
+    }
+
+    /// The gain in decibels.
+    var gainDB: Double {
+        get { volume > 0 ? 20 * log10(volume) : Self.gainRange.lowerBound }
+        set { volume = pow(10, min(max(newValue, Self.gainRange.lowerBound), Self.gainRange.upperBound) / 20) }
+    }
 }
 
 struct ShowSettings: Codable, Hashable {

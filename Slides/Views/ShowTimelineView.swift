@@ -8,6 +8,8 @@ struct ShowTimelineView: View {
     @Binding var currentID: UUID?
     /// Where a Shift-click range starts; shared with the photo grid.
     @Binding var anchorID: UUID?
+    /// Selected music clips. Selecting any clears the photo selection, and vice versa.
+    @Binding var selectedClips: Set<UUID>
     let playback: PlaybackController
     /// Timeline zoom level.
     @Binding var pointsPerSecond: Double
@@ -16,6 +18,8 @@ struct ShowTimelineView: View {
     var onSeek: () -> Void
     /// Double-click a photo: edit it.
     var onOpen: (UUID) -> Void
+    /// Double-click a music clip: edit it.
+    var onOpenClip: (UUID) -> Void
     var onAddAudio: (_ urls: [URL], _ time: Double) -> Void
 
     static let maxPointsPerSecond = 400.0
@@ -24,17 +28,18 @@ struct ShowTimelineView: View {
     static let zoomStep = 1.5
     /// A slide duration being dragged, applied live and committed when the drag ends.
     @State private var durationEdit: (id: UUID, seconds: Double)?
+    /// Photos being dragged to a new place: how far, and where the pointer is.
+    @State private var slideDrag: (ids: Set<UUID>, translation: CGFloat, location: CGFloat)?
     /// A music clip being moved or trimmed.
     @State private var clipEdit: AudioClip?
     @State private var audioTargeted = false
-    @State private var selectedClips: Set<UUID> = []
     @FocusState private var focused: Bool
     @State private var scrollPosition = ScrollPosition(edge: .leading)
     @State private var visibleRect: CGRect = .zero
 
     private let rulerHeight: CGFloat = 22
     private let slideRowHeight: CGFloat = 46
-    private let clipRowHeight: CGFloat = 30
+    private let clipRowHeight: CGFloat = 38
     private let laneSpacing: CGFloat = 6
 
     private var settings: ShowSettings { document.show.settings }
@@ -55,7 +60,8 @@ struct ShowTimelineView: View {
         VStack(spacing: 0) {
             header(duration: timeline.duration)
             Divider()
-            ScrollView(.horizontal) {
+            // Vertical too, so a short timeline scrolls rather than spilling over the divider.
+            ScrollView([.horizontal, .vertical]) {
                 ZStack(alignment: .topLeading) {
                     VStack(alignment: .leading, spacing: laneSpacing) {
                         ruler(width: contentWidth)
@@ -193,21 +199,64 @@ struct ShowTimelineView: View {
             Color.clear
             ForEach(timeline.entries, id: \.id) { entry in
                 let slide = document.show.slides[entry.index]
+                let dragging = slideDrag?.ids.contains(slide.id) == true
                 SlideBlock(slide: slide, entry: entry, settings: settings, pointsPerSecond: pointsPerSecond,
                            isSelected: selection.contains(slide.id))
                     .frame(width: max(entry.duration * pointsPerSecond, 4), height: slideRowHeight)
                     .overlay(alignment: .trailing) { durationHandle(for: slide) }
-                    .offset(x: entry.start * pointsPerSecond,
+                    .opacity(dragging ? 0.6 : 1)
+                    .offset(x: entry.start * pointsPerSecond + (dragging ? slideDrag!.translation : 0),
                             y: entry.index.isMultiple(of: 2) ? 0 : slideRowHeight + 4)
+                    .zIndex(dragging ? 1 : 0)
                     .onTapGesture { select(slide.id, entry: entry) }
                     .simultaneousGesture(TapGesture(count: 2).onEnded { onOpen(slide.id) })
+                    .gesture(reorderGesture(slide.id, timeline))
                     .contextMenu {
                         Button("Reset Duration") { document.show.slides[entry.index].duration = nil }
                             .disabled(slide.duration == nil)
                         Button("Delete") { document.removeSlides([slide.id]) }
                     }
             }
+            if let slideDrag {
+                // Where the photos will land.
+                Capsule()
+                    .fill(Color.accentColor)
+                    .frame(width: 4, height: slideRowHeight * 2 + 4)
+                    .offset(x: dropX(slideDrag.location, timeline) - 2)
+                    .allowsHitTesting(false)
+            }
         }
+    }
+
+    /// Dragging a photo moves it, or all the selected photos if it's one of them, to
+    /// wherever it's dropped.
+    private func reorderGesture(_ id: UUID, _ timeline: ShowTimeline) -> some Gesture {
+        DragGesture(minimumDistance: 4, coordinateSpace: .named("timeline"))
+            .onChanged { value in
+                let ids = slideDrag?.ids ?? (selection.contains(id) ? selection : [id])
+                slideDrag = (ids, value.translation.width, value.location.x)
+            }
+            .onEnded { value in
+                guard let drag = slideDrag else { return }
+                slideDrag = nil
+                let entries = timeline.entries
+                let index = dropIndex(value.location.x, timeline)
+                // Land before the first photo at or after the drop point that isn't moving.
+                let target = entries[index...].first { !drag.ids.contains($0.id) }
+                document.moveSlides(drag.ids, to: target?.id, after: target == nil)
+                if !drag.ids.contains(where: selection.contains) { selection = drag.ids }
+            }
+    }
+
+    /// The index of the photo a drop at `x` goes before (or the count, for the end).
+    private func dropIndex(_ x: CGFloat, _ timeline: ShowTimeline) -> Int {
+        timeline.entries.firstIndex { x < (($0.start + $0.end) / 2) * pointsPerSecond } ?? timeline.entries.count
+    }
+
+    private func dropX(_ x: CGFloat, _ timeline: ShowTimeline) -> CGFloat {
+        let index = dropIndex(x, timeline)
+        let time = index < timeline.entries.count ? timeline.entries[index].start : timeline.duration
+        return time * pointsPerSecond
     }
 
     private func durationHandle(for slide: Slide) -> some View {
@@ -251,9 +300,16 @@ struct ShowTimelineView: View {
                     .frame(height: clipRowHeight)
             }
             ForEach(clips) { clip in
-                AudioBlock(clip: clip, isSelected: selectedClips.contains(clip.id))
-                    .frame(width: max(clip.length * pointsPerSecond, 4), height: clipRowHeight - 4)
+                let x = clip.start * pointsPerSecond, width = max(clip.length * pointsPerSecond, 4)
+                // Only the part on screen gets a waveform, so zooming far in stays cheap.
+                let shown = visibleRect.width > 0
+                    ? max(visibleRect.minX - x, 0)...max(min(visibleRect.maxX - x, width), max(visibleRect.minX - x, 0))
+                    : 0...min(width, 2000)
+                AudioBlock(clip: clip, isSelected: selectedClips.contains(clip.id),
+                           pointsPerSecond: pointsPerSecond, shown: shown)
+                    .frame(width: width, height: clipRowHeight - 4)
                     .onTapGesture { selectClip(clip.id) }
+                    .simultaneousGesture(TapGesture(count: 2).onEnded { onOpenClip(clip.id) })
                     .gesture(clipGesture(clip) { c, dt in c.start = max(0, c.start + dt) })
                     .overlay(alignment: .leading) {
                         trimHandle(clip, edge: .leading) { c, dt in
@@ -316,16 +372,7 @@ struct ShowTimelineView: View {
 
     @ViewBuilder
     private func clipMenu(_ clip: AudioClip) -> some View {
-        Menu("Volume") {
-            ForEach([1.0, 0.75, 0.5, 0.25], id: \.self) { volume in
-                Button {
-                    setClip(clip.id) { $0.volume = volume }
-                } label: {
-                    if abs(clip.volume - volume) < 0.01 { Label("\(Int(volume * 100))%", systemImage: "checkmark") }
-                    else { Text("\(Int(volume * 100))%") }
-                }
-            }
-        }
+        Button("Edit Gain and Fades…") { onOpenClip(clip.id) }
         Button("Copy Into Document") { document.embedMedia(slideIDs: [], clipIDs: [clip.id]) }
             .disabled(clip.source.isEmbedded)
         Divider()
@@ -411,27 +458,83 @@ private struct SlideBlock: View {
 private struct AudioBlock: View {
     let clip: AudioClip
     let isSelected: Bool
+    let pointsPerSecond: Double
+    /// The part of the clip on screen, in points from its left edge.
+    let shown: ClosedRange<Double>
+    @State private var waveform: Waveform?
 
     var body: some View {
-        HStack(spacing: 4) {
-            Image(systemName: "music.note")
-            Text(clip.name).lineLimit(1)
-            if clip.volume < 0.99 {
-                Text("\(Int(clip.volume * 100))%").foregroundStyle(.white.opacity(0.7))
+        ZStack(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 4).fill(Color.green.opacity(0.7))
+            if let waveform, shown.upperBound > shown.lowerBound {
+                waveformView(waveform)
+                    .frame(width: shown.upperBound - shown.lowerBound)
+                    .offset(x: shown.lowerBound)
             }
-            Spacer(minLength: 0)
+            HStack(spacing: 4) {
+                Image(systemName: "music.note")
+                Text(clip.name).lineLimit(1)
+                if abs(clip.gainDB) >= 0.05 {
+                    Text(String(format: "%+.1f dB", clip.gainDB)).foregroundStyle(.white.opacity(0.8))
+                }
+                Spacer(minLength: 0)
+            }
+            .font(.caption)
+            .foregroundStyle(.white)
+            .shadow(color: .black.opacity(0.6), radius: 1)
+            .padding(.horizontal, 6)
         }
-        .font(.caption)
-        .foregroundStyle(.white)
-        .padding(.horizontal, 6)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color.green.opacity(0.7), in: RoundedRectangle(cornerRadius: 4))
+        .overlay(alignment: .leading) { fadeShade(clip.fadeInDuration, leading: true) }
+        .overlay(alignment: .trailing) { fadeShade(clip.fadeOutDuration, leading: false) }
+        .clipShape(RoundedRectangle(cornerRadius: 4))
         .overlay {
             RoundedRectangle(cornerRadius: 4)
                 .strokeBorder(isSelected ? Color.yellow : .clear, lineWidth: 2)
         }
         .contentShape(Rectangle())
         .help(clip.name)
+        .task(id: clip.source) { waveform = await WaveformCache.waveform(for: clip.source) }
+    }
+
+    /// A fade, drawn as a ramp of shade at the end of the clip.
+    private func fadeShade(_ seconds: Double, leading: Bool) -> some View {
+        FadeRamp(rising: leading)
+            .fill(.black.opacity(0.35))
+            .frame(width: seconds * pointsPerSecond)
+            .allowsHitTesting(false)
+    }
+
+    /// The loudest moment in each couple of points, drawn as a bar centered vertically.
+    private func waveformView(_ waveform: Waveform) -> some View {
+        Canvas { context, size in
+            let step = 2.0
+            let scale = Float(clip.volume) * Float(size.height - 2)
+            let maxHeight = size.height - 2
+            var path = Path()
+            var x = 0.0
+            while x < size.width {
+                let t = clip.offset + (shown.lowerBound + x) / pointsPerSecond
+                let height = min(max(CGFloat(waveform.peak(from: t, to: t + step / pointsPerSecond) * scale), 1), maxHeight)
+                path.addRect(CGRect(x: x, y: (size.height - height) / 2, width: step - 0.5, height: height))
+                x += step
+            }
+            context.fill(path, with: .color(.black.opacity(0.35)))
+        }
+        .allowsHitTesting(false)
+    }
+}
+
+/// The quiet part of a fade: the triangle above a line rising from (or falling to) silence.
+private struct FadeRamp: Shape {
+    let rising: Bool
+
+    func path(in rect: CGRect) -> Path {
+        Path { path in
+            path.move(to: CGPoint(x: rect.minX, y: rect.minY))
+            path.addLine(to: CGPoint(x: rect.maxX, y: rect.minY))
+            path.addLine(to: CGPoint(x: rising ? rect.minX : rect.maxX, y: rect.maxY))
+            path.closeSubpath()
+        }
     }
 }
 

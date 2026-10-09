@@ -38,18 +38,26 @@ final class VideoExporter: @unchecked Sendable {
 
     private var isCancelled: Bool { cancelled.withLock { $0 } }
 
+    /// Black, silent seconds after the show, so the fade to black finishes before the movie ends.
+    static let blackTail = 0.5
+
     /// Tracks one writer input's progress across its callbacks.
     private final class InputState: @unchecked Sendable {
         var frame = 0
         var finished = false
+        /// Where the audio written so far ends, and its format.
+        var end = CMTime.zero
+        var format: CMFormatDescription?
     }
 
     func run() async throws {
         let settings = show.settings
         let total = timeline.duration
         guard total > 0 else { throw Failure.nothingToExport }
+        // Frames past the show's end render black.
+        let movieLength = total + Self.blackTail
         let fps = settings.frameRate
-        let frameCount = Int((total * Double(fps)).rounded(.up))
+        let frameCount = Int((movieLength * Double(fps)).rounded(.up))
         let size = CGSize(width: settings.outputWidth, height: settings.outputHeight)
 
         try? FileManager.default.removeItem(at: outputURL)
@@ -168,8 +176,12 @@ final class VideoExporter: @unchecked Sendable {
                 let audio = InputState()
                 audioInput.requestMediaDataWhenReady(on: DispatchQueue(label: "Slides.export.audio")) { [self] in
                     guard !audio.finished else { return }
+                    let movieEnd = AudioComposer.cmTime(movieLength)
                     while audioInput.isReadyForMoreMediaData {
-                        if !isCancelled, let sample = audioOutput.copyNextSampleBuffer(), audioInput.append(sample) {
+                        if !isCancelled, let sample = audioOutput.copyNextSampleBuffer() ?? Self.silence(after: audio, until: movieEnd),
+                           audioInput.append(sample) {
+                            audio.end = CMSampleBufferGetPresentationTimeStamp(sample) + CMSampleBufferGetDuration(sample)
+                            audio.format = CMSampleBufferGetFormatDescription(sample)
                             continue
                         }
                         audioInput.markAsFinished()
@@ -193,5 +205,29 @@ final class VideoExporter: @unchecked Sendable {
         guard writer.status == .completed else {
             throw Failure.writer(writer.error?.localizedDescription ?? "The movie couldn't be written.")
         }
+    }
+
+    /// Up to a tenth of a second of silence following the music, until the movie ends; nil once it does.
+    private static func silence(after audio: InputState, until end: CMTime) -> CMSampleBuffer? {
+        guard let format = audio.format, audio.end < end,
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee,
+              asbd.mBytesPerFrame > 0, asbd.mSampleRate > 0
+        else { return nil }
+        let remaining = Int(((end - audio.end).seconds * asbd.mSampleRate).rounded(.up))
+        let frames = min(remaining, Int(asbd.mSampleRate / 10))
+        guard frames > 0 else { return nil }
+        let bytes = frames * Int(asbd.mBytesPerFrame)
+        var block: CMBlockBuffer?
+        guard CMBlockBufferCreateWithMemoryBlock(allocator: nil, memoryBlock: nil, blockLength: bytes, blockAllocator: nil,
+                                                 customBlockSource: nil, offsetToData: 0, dataLength: bytes,
+                                                 flags: kCMBlockBufferAssureMemoryNowFlag, blockBufferOut: &block) == noErr,
+              let block, CMBlockBufferFillDataBytes(with: 0, blockBuffer: block, offsetIntoDestination: 0,
+                                                    dataLength: bytes) == noErr
+        else { return nil }
+        var sample: CMSampleBuffer?
+        CMAudioSampleBufferCreateReadyWithPacketDescriptions(
+            allocator: nil, dataBuffer: block, formatDescription: format, sampleCount: frames,
+            presentationTimeStamp: audio.end, packetDescriptions: nil, sampleBufferOut: &sample)
+        return sample
     }
 }

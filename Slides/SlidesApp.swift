@@ -8,7 +8,17 @@ struct SlidesApp: App {
                 .frame(minWidth: 960, minHeight: 640)
         }
         .defaultSize(width: 1400, height: 900)
-        .commands { ShowMenuCommands() }
+        .commands {
+            ShowMenuCommands()
+            HelpCommands()
+        }
+
+        Window("Slides Help", id: HelpView.windowID) {
+            HelpView()
+        }
+        .windowLevel(.floating)
+        .defaultSize(width: 560, height: 720)
+        .restorationBehavior(.disabled)
     }
 }
 
@@ -31,6 +41,12 @@ struct ShowMenuCommands: Commands {
                 Button("Find Faces") { show?.findFaces() }
             }
             .disabled(show?.hasPhotoSelection != true)
+        }
+        CommandGroup(after: .pasteboard) {
+            Divider()
+            Button("Split Music at Playhead") { show?.splitMusic() }
+                .keyboardShortcut("b", modifiers: .command)
+                .disabled(show?.canSplitMusic != true)
         }
         CommandGroup(after: .toolbar) {
             Button("Zoom In Timeline") { show?.zoomTimeline(ShowTimelineView.zoomStep) }
